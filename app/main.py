@@ -341,10 +341,11 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
             <p class="connected">✓ Connected to Yahoo</p>
             <p>Yahoo GUID: <code>""" + user.yahoo_guid + """</code></p>
             <p>Token expires: """ + user.token_expiry.strftime("%Y-%m-%d %H:%M:%S UTC") + """</p>
-            <a href="/sync" class="btn">🔄 Sync from Yahoo</a>
-        </div>
-        
-        <h2>Your Fantasy Leagues</h2>
+        <a href="/sync" class="btn">🔄 Sync from Yahoo</a>
+        <a href="/standings" class="btn">📊 View All Standings</a>
+    </div>
+    
+    <h2>Your Fantasy Leagues</h2>
     """
     
     if not leagues:
@@ -389,6 +390,7 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
 async def sync(request: Request, db: Session = Depends(get_db)):
     """
     Sync all Yahoo Fantasy data for the current user.
+    Redirects back to dashboard after sync.
     """
     user = get_current_user(request, db)
     
@@ -403,24 +405,16 @@ async def sync(request: Request, db: Session = Depends(get_db)):
         leagues = client.sync_leagues()
         logger.info(f"Synced {len(leagues)} leagues")
         
-        return {
-            "status": "success",
-            "message": f"Successfully synced {len(leagues)} leagues",
-            "leagues_synced": len(leagues)
-        }
+        return RedirectResponse("/dashboard")
         
     except YahooAPIError as e:
         logger.error(f"Sync failed: {e}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Sync failed: {str(e)}"
-        )
+        request.session["sync_error"] = str(e)
+        return RedirectResponse("/dashboard")
     except Exception as e:
         logger.error(f"Unexpected sync error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Sync failed: {str(e)}"
-        )
+        request.session["sync_error"] = str(e)
+        return RedirectResponse("/dashboard")
 
 
 @app.get("/sync/roster/{team_key}", response_class=HTMLResponse)
@@ -518,6 +512,195 @@ async def sync_roster(team_key: str, request: Request, db: Session = Depends(get
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/standings", response_class=HTMLResponse)
+async def view_all_standings(request: Request, db: Session = Depends(get_db)):
+    """
+    Show standings for all leagues.
+    """
+    user = get_current_user(request, db)
+    
+    if not user:
+        return RedirectResponse("/login")
+    
+    # Get all leagues for this user
+    leagues = db.query(League).filter(League.user_id == user.id).all()
+    
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>All Standings - Fantasy Baseball Assistant</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 20px;
+                background: #1a1a2e;
+                color: #eee;
+            }
+            .league-standings {
+                background: #16213e;
+                padding: 20px;
+                border-radius: 10px;
+                margin: 20px 0;
+                border: 1px solid #333;
+            }
+            h1 { color: #e94560; }
+            h2 { color: #e94560; border-bottom: 1px solid #333; padding-bottom: 10px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
+            th { color: #888; background: #0f3460; }
+            tr:nth-child(even) { background: #0f3460; }
+            .btn {
+                display: inline-block;
+                padding: 8px 16px;
+                background: #e94560;
+                color: white;
+                text-decoration: none;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+            .btn-secondary {
+                background: #333;
+                color: white;
+                text-decoration: none;
+                padding: 8px 16px;
+                border-radius: 5px;
+            }
+            .header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 20px 0;
+                border-bottom: 1px solid #333;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🏆 All League Standings</h1>
+            <div>
+                <a href="/dashboard" class="btn-secondary">Dashboard</a>
+                <a href="/sync" class="btn">🔄 Sync Standings</a>
+            </div>
+        </div>
+    """
+    
+    for league in leagues:
+        html += f"""
+        <div class="league-standings">
+            <h2>{league.name}</h2>
+            <p>Current Week: {league.current_week} | Teams: {league.num_teams}</p>
+            <a href="/sync/standings/{league.league_key}" class="btn">Refresh Standings</a>
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Team</th>
+                    <th>Total</th>
+                    <th></th>
+                </tr>
+        """
+        
+        # Get cached standings from DB
+        standings_record = get_latest_standings(db, league.id)
+        if standings_record and isinstance(standings_record.standings_data, list):
+            teams = standings_record.standings_data
+            
+            # Check if this is a category league (team_points.total is always "0")
+            is_category_league = False
+            for t in teams:
+                tp = t.get("team_points", {})
+                total = tp.get("total") if isinstance(tp, dict) else None
+                if total and float(total) > 0:
+                    is_category_league = False
+                    break
+                elif total and float(total) == 0 and t.get("league_scoring_type") == "head":
+                    is_category_league = True
+            
+            # Stat name mapping for category leagues
+            cat_names = {
+                "7": "R", "12": "HR", "13": "RBI", "16": "SB",
+                "4": "AVG", "5": "OBP", "3": "BA", "55": "OPS",
+                "50": "IP", "26": "ERA", "27": "WHIP",
+                "57": "K", "83": "SV", "89": "HLD",
+                "28": "W", "32": "QS", "22": "K"
+            }
+            
+            if is_category_league:
+                # Collect all stat categories present
+                stat_ids = []
+                for t in teams:
+                    ts = t.get("team_stats", {})
+                    stats_arr = ts.get("stats", []) if isinstance(ts, dict) else []
+                    for s_entry in stats_arr:
+                        if isinstance(s_entry, dict):
+                            sid = s_entry.get("stat", {}).get("stat_id")
+                            if sid and sid not in stat_ids:
+                                stat_ids.append(sid)
+                
+                # Add extra stat columns
+                html += '<tr><th>Rk</th><th>Team</th>'
+                for sid in stat_ids:
+                    name = cat_names.get(sid, sid)
+                    html += f'<th>{name}</th>'
+                html += '</tr>'
+                
+                for team_data in teams:
+                    name = team_data.get("name", "Unknown")
+                    ts = team_data.get("team_stats", {})
+                    stats_arr = ts.get("stats", []) if isinstance(ts, dict) else []
+                    stats_map = {}
+                    for s_entry in stats_arr:
+                        if isinstance(s_entry, dict):
+                            s = s_entry.get("stat", {})
+                            sid = s.get("stat_id")
+                            val = s.get("value", "")
+                            if sid:
+                                stats_map[sid] = val if val else "-"
+                    
+                    html += '<tr>'
+                    html += f'<td>{teams.index(team_data) + 1}</td>'
+                    html += f'<td>{name}</td>'
+                    for sid in stat_ids:
+                        html += f'<td>{stats_map.get(sid, "-")}</td>'
+                    html += '</tr>'
+            else:
+                # Points league - sort by total points desc
+                def _sort_key(t):
+                    tp = t.get("team_points", {})
+                    total = tp.get("total") if isinstance(tp, dict) else None
+                    return -float(total) if total else 0
+                
+                sorted_teams = sorted(teams, key=_sort_key)
+                
+                rank = 1
+                for team_data in sorted_teams:
+                    name = team_data.get("name", "Unknown")
+                    team_points = team_data.get("team_points", {})
+                    total = float(team_points.get("total", 0)) if isinstance(team_points, dict) else 0
+                    
+                    html += f"""
+                        <tr>
+                            <td>{rank}</td>
+                            <td>{name}</td>
+                            <td><strong>{total:.1f}</strong></td>
+                            <td>pts</td>
+                        </tr>
+                    """
+                    rank += 1
+        else:
+            html += '<tr><td colspan="4">No standings data available. <a href="/sync/standings/{league.league_key}">Sync now</a></td></tr>'
+        
+        html += "</table></div>"
+    
+    html += """
+    </body>
+    </html>
+    """
+    return html
+
+
 @app.get("/sync/standings/{league_key}", response_class=HTMLResponse)
 async def sync_standings(league_key: str, request: Request, db: Session = Depends(get_db)):
     """
@@ -546,6 +729,23 @@ async def sync_standings(league_key: str, request: Request, db: Session = Depend
         # Format response
         teams = standings.standings_data if isinstance(standings.standings_data, list) else [standings.standings_data]
         
+        # Detect league type
+        is_category_league = False
+        for t in teams:
+            tp = t.get("team_points", {})
+            total = tp.get("total") if isinstance(tp, dict) else None
+            if total and float(total) == 0 and t.get("league_scoring_type") == "head":
+                is_category_league = True
+        
+        # Stat name mapping for category leagues
+        cat_names = {
+            "7": "R", "12": "HR", "13": "RBI", "16": "SB",
+            "4": "AVG", "5": "OBP", "3": "BA", "55": "OPS",
+            "50": "IP", "26": "ERA", "27": "WHIP",
+            "57": "K", "83": "SV", "89": "HLD",
+            "28": "W", "32": "QS", "22": "K"
+        }
+        
         html = """
         <!DOCTYPE html>
         <html>
@@ -554,15 +754,16 @@ async def sync_standings(league_key: str, request: Request, db: Session = Depend
             <style>
                 body {
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    max-width: 1200px;
+                    max-width: 1400px;
                     margin: 0 auto;
                     padding: 20px;
                     background: #1a1a2e;
                     color: #eee;
                 }
-                table { width: 100%; border-collapse: collapse; }
-                th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
-                th { color: #888; background: #16213e; }
+                table { width: 100%; border-collapse: collapse; font-size: 14px; }
+                th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #333; white-space: nowrap; }
+                th { color: #888; background: #16213e; position: sticky; top: 0; }
+                tr:nth-child(even) { background: rgba(15, 52, 96, 0.3); }
                 .btn {
                     display: inline-block;
                     padding: 8px 16px;
@@ -575,57 +776,93 @@ async def sync_standings(league_key: str, request: Request, db: Session = Depend
             </style>
         </head>
         <body>
-            <a href="/dashboard" class="btn">← Back to Dashboard</a>
+            <a href="/standings" class="btn">← All Standings</a>
             <h1>Standings: """ + league.name + """</h1>
-            <p>Captured: """ + standings.captured_at.strftime("%Y-%m-%d %H:%M") + """</p>
+            <p>Captured: """ + standings.captured_at.strftime("%Y-%m-%d %H:%M") + """ | Type: """ + ("Category" if is_category_league else "Points") + """ League</p>
+        """
+        
+        if is_category_league:
+            # Collect all stat categories present
+            stat_ids = []
+            for t in teams:
+                ts = t.get("team_stats", {})
+                stats_arr = ts.get("stats", []) if isinstance(ts, dict) else []
+                for s_entry in stats_arr:
+                    if isinstance(s_entry, dict):
+                        sid = s_entry.get("stat", {}).get("stat_id")
+                        if sid and sid not in stat_ids:
+                            stat_ids.append(sid)
             
+            html += """<div style="overflow-x: auto;"><table><tr><th>Rk</th><th>Team</th>"""
+            for sid in stat_ids:
+                name = cat_names.get(sid, sid)
+                html += f'<th>{name}</th>'
+            html += '</tr>'
+            
+            for i, team_data in enumerate(teams):
+                name = team_data.get("name", "Unknown")
+                if isinstance(name, dict):
+                    name = name.get("full", "Unknown")
+                ts = team_data.get("team_stats", {})
+                stats_arr = ts.get("stats", []) if isinstance(ts, dict) else []
+                stats_map = {}
+                for s_entry in stats_arr:
+                    if isinstance(s_entry, dict):
+                        s = s_entry.get("stat", {})
+                        sid = s.get("stat_id")
+                        val = s.get("value", "")
+                        if sid:
+                            stats_map[sid] = val if val else "-"
+                
+                html += '<tr>'
+                html += f'<td>{i + 1}</td>'
+                html += f'<td><strong>{name}</strong></td>'
+                for sid in stat_ids:
+                    html += f'<td>{stats_map.get(sid, "-")}</td>'
+                html += '</tr>'
+            
+            html += '</table></div>'
+        else:
+            # Points league table
+            html += """
             <table>
                 <tr>
                     <th>Rank</th>
                     <th>Team</th>
-                    <th>Wins</th>
-                    <th>Losses</th>
-                    <th>Win %</th>
-                    <th>Games Back</th>
-                </tr>
-        """
-        
-        rank = 1
-        for team_data in teams:
-            if not team_data:
-                continue
-            name = team_data.get("name", {}).get("full", "Unknown") if isinstance(team_data.get("name"), dict) else team_data.get("name", "Unknown")
-            stats = team_data.get("team_stats", {}).get("stats", {}).get("stat", [])
-            
-            wins = 0
-            losses = 0
-            win_pct = 0
-            games_back = "-"
-            
-            for stat in stats if isinstance(stats, list) else []:
-                stat_id = stat.get("stat_id") or stat.get("@id")
-                value = stat.get("value", "0")
-                if str(stat_id) == "0":  # Wins
-                    wins = int(value)
-                elif str(stat_id) == "1":  # Losses
-                    losses = int(value)
-                elif str(stat_id) == "2":  # Win %
-                    win_pct = float(value) if value else 0
-            
-            html += f"""
-                <tr>
-                    <td>{rank}</td>
-                    <td>{name}</td>
-                    <td>{wins}</td>
-                    <td>{losses}</td>
-                    <td>{win_pct:.3f}</td>
-                    <td>{games_back}</td>
+                    <th>Total</th>
+                    <th></th>
                 </tr>
             """
-            rank += 1
+            
+            # Sort by total points desc
+            def _sort_key(t):
+                tp = t.get("team_points", {})
+                total = tp.get("total") if isinstance(tp, dict) else None
+                return -float(total) if total else 0
+            
+            sorted_teams = sorted(teams, key=_sort_key)
+            
+            rank = 1
+            for team_data in sorted_teams:
+                name = team_data.get("name", "Unknown")
+                if isinstance(name, dict):
+                    name = name.get("full", "Unknown")
+                team_points = team_data.get("team_points", {})
+                total = float(team_points.get("total", 0)) if isinstance(team_points, dict) else 0
+                
+                html += f"""
+                    <tr>
+                        <td>{rank}</td>
+                        <td><strong>{name}</strong></td>
+                        <td>{total:.1f}</td>
+                        <td>pts</td>
+                    </tr>
+                """
+                rank += 1
+            
+            html += "</table>"
         
         html += """
-            </table>
         </body>
         </html>
         """
@@ -684,34 +921,4 @@ async def api_teams(request: Request, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    settings = get_settings()
-
-    if settings.YAHOO_REDIRECT_URI.startswith("https://") and not (
-        settings.SSL_CERTFILE and settings.SSL_KEYFILE
-    ):
-        logger.warning(
-            "YAHOO_REDIRECT_URI is https but SSL_CERTFILE/SSL_KEYFILE are not configured. "
-            "This may cause OAuth callback failures for local HTTPS redirects."
-        )
-
-    uvicorn_kwargs = {
-        "host": settings.HOST,
-        "port": settings.PORT,
-    }
-
-    if settings.SSL_CERTFILE and settings.SSL_KEYFILE:
-        uvicorn_kwargs["ssl_certfile"] = settings.SSL_CERTFILE
-        uvicorn_kwargs["ssl_keyfile"] = settings.SSL_KEYFILE
-        logger.info(
-            "Starting Fantasy Baseball Assistant with HTTPS on %s:%s",
-            settings.HOST,
-            settings.PORT,
-        )
-    else:
-        logger.info(
-            "Starting Fantasy Baseball Assistant without HTTPS on %s:%s",
-            settings.HOST,
-            settings.PORT,
-        )
-
-    uvicorn.run(app, **uvicorn_kwargs)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -26,6 +26,46 @@ class YahooAPIError(Exception):
     pass
 
 
+def _extract_metadata(item: Any) -> dict:
+    """
+    Yahoo returns items as either a plain dict or a list [metadata, subresources].
+    This extracts just the metadata (index 0 of list, or the dict itself).
+    """
+    if isinstance(item, list):
+        return item[0] if len(item) > 0 and isinstance(item[0], dict) else {}
+    return item if isinstance(item, dict) else {}
+
+
+def _get_subresources(item: Any) -> dict:
+    """
+    Yahoo returns items as either a plain dict or a list [metadata, subresources].
+    This extracts the sub-resources dict (index 1 of list).
+    """
+    if isinstance(item, list) and len(item) > 1 and isinstance(item[1], dict):
+        return item[1]
+    return {}
+
+
+def _extract_items_from_container(container: Any, outer_key: str) -> list[tuple[dict, dict]]:
+    """
+    Extract items from Yahoo's numeric-keyed container.
+    Returns list of (metadata, subresources) tuples.
+    
+    Yahoo format: {0: {outer_key: [metadata, {subresources}]}, 1: {...}}
+    """
+    results = []
+    if not isinstance(container, dict):
+        return results
+    for k in sorted(container.keys(), key=lambda x: (not str(x).isdigit(), int(x) if str(x).isdigit() else x)):
+        entry = container[k]
+        if isinstance(entry, dict) and outer_key in entry:
+            item = entry[outer_key]
+            metadata = _extract_metadata(item)
+            sub = _get_subresources(item)
+            results.append((metadata, sub))
+    return results
+
+
 class YahooFantasyClient:
     """
     Yahoo Fantasy Sports API client.
@@ -33,43 +73,21 @@ class YahooFantasyClient:
     """
     
     def __init__(self, user: User, db: Session):
-        """
-        Initialize the Yahoo Fantasy client.
-        
-        Args:
-            user: Authenticated user with valid tokens
-            db: Database session
-        """
         self.user = user
         self.db = db
         self.settings = get_settings()
         self.oauth = get_yahoo_oauth()
         self.base_url = self.settings.YAHOO_API_BASE.rstrip("/")
-        
-        # Ensure valid access token
         self._ensure_valid_token()
     
     def _ensure_valid_token(self) -> None:
-        """Refresh token if expired."""
         if self.user.is_token_expired():
             logger.info(f"Token expired for user {self.user.yahoo_guid[:8]}..., refreshing")
             self.user = self.oauth.refresh_user_token(self.db, self.user)
             logger.info("Token refreshed successfully")
     
     def _make_request(self, method: str, url: str, **kwargs) -> dict:
-        """
-        Make an authenticated request to Yahoo API.
-        
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            url: Full URL to request
-            **kwargs: Additional arguments for httpx
-            
-        Returns:
-            Parsed JSON response
-        """
         self._ensure_valid_token()
-        
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.user.access_token}"
         headers["Accept"] = "application/json"
@@ -77,132 +95,105 @@ class YahooFantasyClient:
         try:
             with httpx.Client(timeout=60.0) as client:
                 response = client.request(method, url, headers=headers, **kwargs)
-            
             if response.status_code == 401:
-                # Token might have been revoked, try refreshing
                 logger.warning("Received 401, attempting token refresh")
                 self.user = self.oauth.refresh_user_token(self.db, self.user)
                 headers["Authorization"] = f"Bearer {self.user.access_token}"
-                
                 with httpx.Client(timeout=60.0) as client:
                     response = client.request(method, url, headers=headers, **kwargs)
-            
             if response.status_code != 200:
                 logger.error(f"API request failed: {response.status_code} - {response.text[:200]}")
                 raise YahooAPIError(f"API request failed: {response.text[:500]}")
-            
             logger.debug(f"API request successful: {url}")
             return response.json()
-            
         except httpx.HTTPError as e:
             logger.error(f"HTTP error during API request: {e}")
             raise YahooAPIError(f"API request failed: {str(e)}")
     
-    def get_games(self) -> list[dict]:
+    def get_games(self) -> list[tuple[dict, dict]]:
         """
         Get user's fantasy games.
-        Note: Yahoo API uses game_keys parameter to filter games.
-        
-        Returns:
-            List of game objects
+        Returns list of (metadata, sub_resources) tuples.
         """
         logger.info("Fetching Yahoo games")
+        url = f"{self.base_url}/users;use_login=1/games?format=json"
+        data = self._make_request("GET", url)
         
-        # Yahoo API endpoint for user games
-        # game_keys=mlb filters to Major League Baseball
-        # use_login=1 ensures we get the logged-in user's data
-        url = f"{self.base_url}/users;use_login=1/games"
-        params = {"game_keys": "mlb", "format": "json"}
-        
-        url_with_params = f"{url}?game_keys=mlb&format=json"
-        data = self._make_request("GET", url_with_params)
-        
-        # Parse games from Yahoo response
         games = []
-        if "fantasy_content" in data:
-            fc = data["fantasy_content"]
-            users = fc.get("users") or fc.get("user")
-            if isinstance(users, dict):
-                user = users.get("user")
-                if isinstance(user, list):
-                    user = user[0]
-                if user and "games" in user:
-                    game_list = user["games"].get("game")
-                    if isinstance(game_list, dict):
-                        game_list = [game_list]
-                    games = game_list if isinstance(game_list, list) else []
-        elif "games" in data and "game" in data["games"]:
-            game_list = data["games"]["game"]
-            if isinstance(game_list, dict):
-                game_list = [game_list]
-            games = game_list if isinstance(game_list, list) else []
+        try:
+            fc = data.get("fantasy_content", {})
+            users_container = fc.get("users", fc)
+            # users: {0: {user: [metadata, {games: {...}}]}}
+            for user_meta, user_sub in _extract_items_from_container(users_container, "user"):
+                games_container = user_sub.get("games", {})
+                games = _extract_items_from_container(games_container, "game")
+        except Exception as e:
+            logger.warning(f"Error parsing games: {e}")
         
         logger.info(f"Found {len(games)} games")
         return games
     
     def get_leagues(self) -> list[dict]:
         """
-        Get user's fantasy baseball leagues.
-        Note: This endpoint returns league info, not teams within leagues.
-        
-        Returns:
-            List of league objects
+        Get user's active fantasy baseball leagues.
+        Only fetches leagues for active, non-offseason MLB games.
         """
-        logger.info("Fetching Yahoo leagues")
+        logger.info("Discovering active MLB game keys")
+        games = self.get_games()
         
-        # Yahoo API endpoint for user's leagues
-        # game_keys=mlb specifies Major League Baseball
-        url = f"{self.base_url}/users;use_login=1/games"
-        url_with_params = f"{url}?game_keys=mlb&format=json"
+        # Find the most recent active MLB game
+        target_game_key = None
+        for game_meta, _ in games:
+            code = game_meta.get("code", "")
+            is_game_over = int(game_meta.get("is_game_over", 1))
+            is_offseason = int(game_meta.get("is_offseason", 1))
+            game_key = game_meta.get("game_key", "")
+            
+            if code == "mlb" and not is_game_over and not is_offseason:
+                target_game_key = game_key
+                logger.info(f"Found active MLB game: key={game_key}, season={game_meta.get('season')}")
+                break
         
-        data = self._make_request("GET", url_with_params)
+        if not target_game_key:
+            logger.warning("No active MLB game found")
+            return []
         
-        # Parse leagues from Yahoo response
-        leagues = []
-        if "fantasy_content" in data:
-            fc = data["fantasy_content"]
-            users = fc.get("users") or fc.get("user")
-            if isinstance(users, dict):
-                user = users.get("user")
-                if isinstance(user, list):
-                    user = user[0]
-                if user and "games" in user:
-                    game = user["games"].get("game")
-                    if isinstance(game, dict) and "leagues" in game:
-                        league_data = game["leagues"]
-                        if "league" in league_data:
-                            league_list = league_data["league"]
-                            leagues = league_list if isinstance(league_list, list) else [league_list]
-        elif "games" in data and "game" in data["games"]:
-            game = data["games"]["game"]
-            if isinstance(game, dict) and "leagues" in game:
-                league_data = game["leagues"]
-                if "league" in league_data:
-                    league_list = league_data["league"]
-                    leagues = league_list if isinstance(league_list, list) else [league_list]
-        
-        logger.info(f"Found {len(leagues)} leagues")
-        return leagues
+        # Fetch leagues for this active game
+        try:
+            url = f"{self.base_url}/users;use_login=1/games;game_keys={target_game_key}/leagues?format=json"
+            data = self._make_request("GET", url)
+            
+            fc = data.get("fantasy_content", {})
+            users_container = fc.get("users", fc)
+            leagues = []
+            for user_meta, user_sub in _extract_items_from_container(users_container, "user"):
+                games_container = user_sub.get("games", {})
+                for game_meta, game_sub in _extract_items_from_container(games_container, "game"):
+                    leagues_container = game_sub.get("leagues", {})
+                    for league_meta, league_sub in _extract_items_from_container(leagues_container, "league"):
+                        leagues.append(league_meta)
+            
+            logger.info(f"Found {len(leagues)} leagues for game {target_game_key}")
+            return leagues
+            
+        except Exception as e:
+            logger.error(f"Error fetching leagues: {e}")
+            return []
     
     def get_league_metadata(self, league_key: str) -> dict:
-        """
-        Get detailed metadata for a specific league.
-        
-        Args:
-            league_key: Yahoo league key (e.g., "394.l.12345")
-            
-        Returns:
-            League metadata dict
-        """
         logger.info(f"Fetching league metadata for: {league_key}")
-        
-        # Yahoo API endpoint for league metadata
-        url = f"{self.base_url}/game/{league_key.split('.')[0]}/league/{league_key}?format=json"
+        url = f"{self.base_url}/league/{league_key}?format=json"
         data = self._make_request("GET", url)
         
         league_meta = {}
-        if "fantasy_content" in data and "league" in data["fantasy_content"]:
-            league_meta = data["fantasy_content"]["league"]
+        try:
+            fc = data.get("fantasy_content", {})
+            league_container = fc.get("league", {})
+            leagues = _extract_items_from_container(league_container, "league")
+            if leagues:
+                league_meta = leagues[0][0]
+        except Exception as e:
+            logger.warning(f"Error parsing league metadata: {e}")
         
         logger.info(f"Retrieved metadata for league: {league_meta.get('name', 'Unknown')}")
         return league_meta
@@ -211,106 +202,135 @@ class YahooFantasyClient:
         """
         Get league standings.
         
-        Args:
-            league_key: Yahoo league key
-            
-        Returns:
-            List of team standings
+        Yahoo response format:
+        fantasy_content.league = [
+          {league_metadata},                                    # [0]
+          {standings: [{teams: {"0": {team: [props, stats]}, ...}}]}  # [1]
+        ]
+        Each team is an array: [props_array, {team_stats: ...}]
+        props_array contains dicts like {name: "..."}, {team_key: "..."}, etc.
         """
         logger.info(f"Fetching league standings for: {league_key}")
-        
-        # Yahoo API endpoint for league standings
-        url = f"{self.base_url}/game/{league_key.split('.')[0]}/league/{league_key}/standings?format=json"
+        url = f"{self.base_url}/league/{league_key}/standings?format=json"
         data = self._make_request("GET", url)
         
         standings = []
-        if "fantasy_content" in data and "league" in data["fantasy_content"]:
-            league_data = data["fantasy_content"]["league"]
-            if "standings" in league_data and "team" in league_data["standings"]:
-                team_list = league_data["standings"]["team"]
-                standings = team_list if isinstance(team_list, list) else [team_list]
+        try:
+            fc = data.get("fantasy_content", {})
+            league_arr = fc.get("league", [])
+            if not isinstance(league_arr, list) or len(league_arr) < 2:
+                logger.warning(f"Unexpected league format: {type(league_arr)}")
+                return []
+            
+            # league_arr[1] = {standings: [{teams: {...}}]}
+            standings_block = league_arr[1].get("standings") if isinstance(league_arr[1], dict) else None
+            if not isinstance(standings_block, list) or len(standings_block) < 1:
+                return []
+            
+            # standings_block[0] = {teams: {0: {team: [...]}, 1: {...}}}
+            teams_container = standings_block[0].get("teams") if isinstance(standings_block[0], dict) else None
+            if not isinstance(teams_container, dict):
+                return []
+            
+            # teams has numeric keys: {0: {team: [props, stats]}, 1: {...}}
+            for k in sorted(teams_container.keys(), key=lambda x: (not str(x).isdigit(), int(x) if str(x).isdigit() else x)):
+                team_entry = teams_container[k]
+                if not isinstance(team_entry, dict):
+                    continue
+                team_arr = team_entry.get("team", [])
+                if not isinstance(team_arr, list) or len(team_arr) < 1:
+                    continue
+                
+                # team[0] = props_array which contains dicts like {name: ...}, {team_key: ...}
+                props_arr = team_arr[0] if isinstance(team_arr[0], list) else []
+                
+                # Build team dict from props array elements
+                team_data = {}
+                for prop in props_arr:
+                    if isinstance(prop, dict):
+                        team_data.update(prop)
+                
+                # Merge ALL remaining elements from the team array (not just index 1)
+                # Yahoo response varies by league type:
+                #   index 1: {team_stats: ...} (present in all leagues)
+                #   index 2: {team_points: ...} (points leagues)
+                #   index 2/3: {team_standings: ...} (H2H leagues, contains outcome_totals)
+                #   index 3/4: {team_remaining_games: ...} etc.
+                for i in range(1, len(team_arr)):
+                    if isinstance(team_arr[i], dict):
+                        team_data.update(team_arr[i])
+                
+                standings.append(team_data)
+                
+        except Exception as e:
+            logger.warning(f"Error parsing standings: {e}")
         
         logger.info(f"Retrieved {len(standings)} standings entries")
         return standings
     
     def get_team_metadata(self, team_key: str) -> dict:
-        """
-        Get detailed metadata for a specific team.
-        
-        Args:
-            team_key: Yahoo team key (e.g., "394.l.12345.t.1")
-            
-        Returns:
-            Team metadata dict
-        """
         logger.info(f"Fetching team metadata for: {team_key}")
-        
-        # Yahoo API endpoint for team metadata
-        url = f"{self.base_url}/game/{team_key.split('.')[0]}/team/{team_key}?format=json"
+        url = f"{self.base_url}/team/{team_key}?format=json"
         data = self._make_request("GET", url)
         
         team_meta = {}
-        if "fantasy_content" in data and "team" in data["fantasy_content"]:
-            team_meta = data["fantasy_content"]["team"]
+        try:
+            fc = data.get("fantasy_content", {})
+            team_container = fc.get("team", {})
+            teams = _extract_items_from_container(team_container, "team")
+            if teams:
+                team_meta = teams[0][0]
+        except Exception as e:
+            logger.warning(f"Error parsing team metadata: {e}")
         
         logger.info(f"Retrieved metadata for team: {team_meta.get('name', 'Unknown')}")
         return team_meta
     
     def get_team_roster(self, team_key: str, week: Optional[int] = None) -> dict:
-        """
-        Get team roster.
-        
-        Args:
-            team_key: Yahoo team key
-            week: Optional week number (defaults to current week)
-            
-        Returns:
-            Roster data dict
-        """
-        league_key = team_key.rsplit('.t.', 1)[0]
-        week_str = str(week) if week else "0"  # 0 means current week
-        
+        week_str = str(week) if week else "0"
         logger.info(f"Fetching roster for team: {team_key}, week: {week_str}")
-        
-        # Yahoo API endpoint for team roster
-        # Note: week=0 returns current week's roster
-        url = f"{self.base_url}/game/{team_key.split('.')[0]}/team/{team_key}/roster?format=json"
-        params = f"?week={week_str}"
-        data = self._make_request("GET", url + params)
+        url = f"{self.base_url}/team/{team_key}/roster?format=json&week={week_str}"
+        data = self._make_request("GET", url)
         
         roster = {}
-        if "fantasy_content" in data and "team" in data["fantasy_content"]:
-            team_data = data["fantasy_content"]["team"]
-            if "roster" in team_data:
-                roster = team_data["roster"]
+        try:
+            fc = data.get("fantasy_content", {})
+            team_container = fc.get("team", {})
+            for team_meta, team_sub in _extract_items_from_container(team_container, "team"):
+                roster = team_sub.get("roster", {})
+        except Exception as e:
+            logger.warning(f"Error parsing roster: {e}")
         
-        logger.info(f"Retrieved roster with entries")
+        logger.info(f"Retrieved roster")
         return roster
     
+    @staticmethod
+    def _game_key_to_season(game_key: str) -> int:
+        return 2026  # Default to current
+    
     def sync_leagues(self) -> list[League]:
-        """
-        Sync all user's leagues from Yahoo and store in database.
-        
-        Returns:
-            List of synced League objects
-        """
         logger.info("Syncing leagues from Yahoo")
         
-        # Fetch leagues from Yahoo
+        # Delete old leagues that may exist from previous incomplete syncs
+        # Only keep leagues that exist in the current Yahoo season
+        old_leagues = get_leagues_by_user(self.db, self.user.id)
+        old_keys = {l.league_key for l in old_leagues}
+        
         yahoo_leagues = self.get_leagues()
+        new_keys = set()
         synced_leagues = []
         
         for league_data in yahoo_leagues:
             try:
                 league_key = league_data.get("league_key") or league_data.get("key")
+                if not league_key:
+                    continue
+                new_keys.add(league_key)
                 name = league_data.get("name", "Unknown League")
                 game_key = league_data.get("game_key") or league_key.split('.')[0]
-                
-                # Extract additional info if available
-                num_teams = league_data.get("num_teams", 0)
-                current_week = league_data.get("current_week", 0)
-                start_week = league_data.get("start_week", 0)
-                end_week = league_data.get("end_week", 0)
+                season = int(league_data.get("season", self._game_key_to_season(game_key)))
+                num_teams = int(league_data.get("num_teams", 0))
+                current_week = int(league_data.get("current_week", 0))
                 
                 league = upsert_league(
                     self.db,
@@ -318,54 +338,48 @@ class YahooFantasyClient:
                     league_key=league_key,
                     name=name,
                     game_key=game_key,
-                    season=2024,  # Yahoo provides this in URL, not response
-                    league_type="full",
+                    season=season,
+                    league_type=league_data.get("league_type", "full"),
                     num_teams=num_teams,
                     current_week=current_week,
-                    start_week=start_week,
-                    end_week=end_week,
+                    start_week=int(league_data.get("start_week", 0)),
+                    end_week=int(league_data.get("end_week", 0)),
                     league_data=league_data
                 )
                 synced_leagues.append(league)
-                
             except Exception as e:
                 logger.error(f"Error syncing league {league_data}: {e}")
+        
+        # Remove old leagues that are no longer in sync results
+        stale_keys = old_keys - new_keys
+        if stale_keys:
+            logger.info(f"Removing {len(stale_keys)} stale leagues from database")
+            for league in old_leagues:
+                if league.league_key in stale_keys:
+                    self.db.delete(league)
+            self.db.commit()
         
         logger.info(f"Successfully synced {len(synced_leagues)} leagues")
         return synced_leagues
     
     def sync_team(self, team_key: str) -> Team:
-        """
-        Sync a specific team from Yahoo.
-        
-        Args:
-            team_key: Yahoo team key
-            
-        Returns:
-            Synced Team object
-        """
         logger.info(f"Syncing team: {team_key}")
-        
-        # Get team metadata
         team_data = self.get_team_metadata(team_key)
-        
-        # Extract team info
         name = team_data.get("name", "Unknown Team")
         league_key = team_key.rsplit('.t.', 1)[0]
         
-        # Get or create league
         league = self.db.query(League).filter(League.league_key == league_key).first()
         if not league:
+            game_key = team_key.split('.')[0]
             league = upsert_league(
                 self.db,
                 user_id=self.user.id,
                 league_key=league_key,
                 name=league_key,
-                game_key=league_key.split('.')[0],
-                season=2024
+                game_key=game_key,
+                season=2026
             )
         
-        # Upsert team
         team = upsert_team(
             self.db,
             user_id=self.user.id,
@@ -374,65 +388,30 @@ class YahooFantasyClient:
             name=name,
             team_data=team_data
         )
-        
         logger.info(f"Synced team: {name}")
         return team
     
     def sync_roster(self, team: Team, week: Optional[int] = None) -> Roster:
-        """
-        Sync team roster from Yahoo.
-        
-        Args:
-            team: Team object
-            week: Optional week number
-            
-        Returns:
-            Saved Roster object
-        """
         logger.info(f"Syncing roster for team: {team.team_key}")
-        
-        # Get roster from Yahoo
         roster_data = self.get_team_roster(team.team_key, week)
-        
-        # Determine week
         if week is None:
-            week = 0  # Current week
-        
-        # Save roster
+            week = 0
         roster = save_roster(self.db, team.id, week, roster_data)
-        
-        logger.info(f"Saved roster with {len(roster_data.get('players', {}).get('player', []))} players")
         return roster
     
     def sync_standings(self, league: League) -> Standings:
-        """
-        Sync league standings from Yahoo.
-        
-        Args:
-            league: League object
-            
-        Returns:
-            Saved Standings object
-        """
         logger.info(f"Syncing standings for league: {league.league_key}")
-        
-        # Get standings from Yahoo
         standings_data = self.get_league_standings(league.league_key)
-        
-        # Save standings
         standings = save_standings(self.db, league.id, standings_data)
-        
         logger.info(f"Saved standings for {len(standings_data)} teams")
         return standings
 
 
 def get_user_leagues(db: Session, user_id: int) -> list[dict]:
-    """Get all leagues for a user with their Yahoo data."""
     leagues = get_leagues_by_user(db, user_id)
     return [league.to_dict() for league in leagues]
 
 
 def get_user_teams(db: Session, user_id: int) -> list[dict]:
-    """Get all teams for a user."""
     teams = get_teams_by_user(db, user_id)
     return [team.to_dict() for team in teams]
