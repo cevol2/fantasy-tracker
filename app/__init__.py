@@ -1,0 +1,1 @@
+"""Fantasy Baseball Assistant application package."""

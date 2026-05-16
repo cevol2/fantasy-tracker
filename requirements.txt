@@ -1,0 +1,19 @@
+# Fantasy Baseball Assistant - Python Dependencies
+
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.39.0
+
+# OAuth and HTTP
+httpx>=0.26.0
+
+# Database
+sqlalchemy>=2.0.0
+pydantic-settings>=2.0.0
+
+# Session management
+itsdangerous>=2.1.0
+
+# Environment variables
+python-dotenv>=1.0.0
