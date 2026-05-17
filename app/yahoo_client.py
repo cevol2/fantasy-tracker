@@ -376,7 +376,7 @@ class YahooFantasyClient:
         start = 0
         
         while start < count:
-            url = f"{self.base_url}/league/{league_key}/players;status={status};start={start};count={page_size}?format=json"
+            url = f"{self.base_url}/league/{league_key}/players;status={status};start={start};count={page_size}/ownership?format=json"
             logger.info(f"Fetching players batch: start={start}, count={page_size}")
             data = self._make_request("GET", url)
             
