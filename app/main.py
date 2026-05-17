@@ -1220,7 +1220,7 @@ async def view_waiver_wire(league_key: str, request: Request, db: Session = Depe
             raise HTTPException(status_code=404, detail="League not found")
         
         # Fetch available players ('FA' = Free Agents, unowned players)
-        players = client.get_league_players(league_key, status="FA", count=400)
+        players = client.get_league_players(league_key, status="FA", count=600)
         
         html = """
         <!DOCTYPE html>
