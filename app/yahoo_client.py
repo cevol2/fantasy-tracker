@@ -276,14 +276,24 @@ class YahooFantasyClient:
         team_meta = {}
         try:
             fc = data.get("fantasy_content", {})
-            team_container = fc.get("team", {})
-            teams = _extract_items_from_container(team_container, "team")
-            if teams:
-                team_meta = teams[0][0]
+            team_arr = fc.get("team", [])
+            # Yahoo team endpoint returns: [props_array, {sub_resources}]
+            # props_array is a list of single-key dicts like [{name: {full: ...}}, {team_key: ...}, ...]
+            if isinstance(team_arr, list) and len(team_arr) > 0:
+                props_arr = team_arr[0]
+                if isinstance(props_arr, list):
+                    for prop in props_arr:
+                        if isinstance(prop, dict):
+                            team_meta.update(prop)
+                elif isinstance(props_arr, dict):
+                    team_meta.update(props_arr)
         except Exception as e:
             logger.warning(f"Error parsing team metadata: {e}")
         
-        logger.info(f"Retrieved metadata for team: {team_meta.get('name', 'Unknown')}")
+        name = team_meta.get("name", {})
+        if isinstance(name, dict):
+            name = name.get("full", "Unknown")
+        logger.info(f"Retrieved metadata for team: {name}")
         return team_meta
     
     def get_team_roster(self, team_key: str, week: Optional[int] = None) -> dict:
