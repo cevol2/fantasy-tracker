@@ -414,6 +414,11 @@ class YahooFantasyClient:
                     for i in range(1, len(player_arr)):
                         if isinstance(player_arr[i], dict):
                             player_data.update(player_arr[i])
+                    # Debug: log first player's keys to understand data structure
+                    if len(all_players) == 0:
+                        logger.info(f"First player data keys: {list(player_data.keys())}")
+                        if "ownership" in player_data:
+                            logger.info(f"ownership type: {type(player_data['ownership']).__name__}, value: {str(player_data['ownership'])[:200]}")
                     all_players.append(player_data)
                     parsed_count += 1
                 
