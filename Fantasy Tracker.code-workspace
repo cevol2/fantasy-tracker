@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^cd /Users/ryau/AI\\\\ Projects/Fantasy\\\\ Tracker && which python && python --version$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		}
+	}
+}

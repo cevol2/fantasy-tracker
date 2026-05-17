@@ -292,16 +292,55 @@ class YahooFantasyClient:
         url = f"{self.base_url}/team/{team_key}/roster?format=json&week={week_str}"
         data = self._make_request("GET", url)
         
-        roster = {}
+        parsed_players = []
         try:
             fc = data.get("fantasy_content", {})
-            team_container = fc.get("team", {})
-            for team_meta, team_sub in _extract_items_from_container(team_container, "team"):
-                roster = team_sub.get("roster", {})
+            team_arr = fc.get("team", [])
+            # Yahoo returns team as: [metadata_array, {roster: {...}}]
+            if isinstance(team_arr, list) and len(team_arr) > 1:
+                sub = team_arr[1]
+                if isinstance(sub, dict):
+                    # sub = {roster: {0: {players: {0: {player: [props, sub]}, ...}, count: N}}}
+                    roster_container = sub.get("roster", {})
+                    # Extract the first entry with "players" key
+                    players_container = {}
+                    if isinstance(roster_container, dict):
+                        for k in sorted(roster_container.keys(), key=lambda x: (not str(x).isdigit(), int(x) if str(x).isdigit() else x)):
+                            entry = roster_container[k]
+                            if isinstance(entry, dict) and "players" in entry:
+                                players_container = entry["players"]
+                                break
+                    
+                    # Parse players from Yahoo's numeric-keyed container
+                    if isinstance(players_container, dict):
+                        for pk in sorted(players_container.keys(), key=lambda x: (not str(x).isdigit(), int(x) if str(x).isdigit() else x)):
+                            player_entry = players_container[pk]
+                            if not isinstance(player_entry, dict) or "player" not in player_entry:
+                                continue
+                            player_arr = player_entry["player"]
+                            # player_arr is: [props_list_of_dicts, {sub_resources}]
+                            if not isinstance(player_arr, list) or len(player_arr) < 1:
+                                continue
+                            props_list = player_arr[0]
+                            player_data = {}
+                            # props_list is a list of single-key dicts: [{name: {full: ...}}, {selected_position: ...}, ...]
+                            if isinstance(props_list, list):
+                                for prop in props_list:
+                                    if isinstance(prop, dict):
+                                        player_data.update(prop)
+                            elif isinstance(props_list, dict):
+                                player_data.update(props_list)
+                            # Merge subresources (index 1) e.g. player_stats
+                            if len(player_arr) > 1 and isinstance(player_arr[1], dict):
+                                player_data.update(player_arr[1])
+                            parsed_players.append(player_data)
+            
+            roster = {"players": parsed_players}
         except Exception as e:
             logger.warning(f"Error parsing roster: {e}")
+            roster = {"players": parsed_players}
         
-        logger.info(f"Retrieved roster")
+        logger.info(f"Retrieved roster with {len(parsed_players)} players")
         return roster
     
     @staticmethod

@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     YAHOO_API_BASE: str = "https://fantasysports.yahooapis.com/fantasy/v2"
     YAHOO_OAUTH_SCOPE: Optional[str] = None
     
+    # Pre-configured league (optional, for direct sync)
+    # Set from your Yahoo league URL, e.g., https://baseball.fantasysports.yahoo.com/b1/7500/8
+    # means league_key = b1.l.7500
+    YAHOO_LEAGUE_KEY: Optional[str] = None
+    YAHOO_TEAM_KEY: Optional[str] = None
+    
     # Database settings
     DATABASE_URL: str = "sqlite:///./data/fantasy_assistant.db"
     

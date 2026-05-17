@@ -238,6 +238,433 @@ async def logout(request: Request):
     return RedirectResponse("/")
 
 
+@app.get("/league/{league_key}/teams", response_class=HTMLResponse)
+async def view_league_teams(league_key: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Show all teams in a league with links to view each team's roster.
+    """
+    user = get_current_user(request, db)
+    
+    if not user:
+        return RedirectResponse("/login")
+    
+    try:
+        client = YahooFantasyClient(user, db)
+        
+        # Get or sync league
+        league = db.query(League).filter(League.league_key == league_key).first()
+        if not league:
+            client.sync_leagues()
+            league = db.query(League).filter(League.league_key == league_key).first()
+        
+        if not league:
+            raise HTTPException(status_code=404, detail="League not found")
+        
+        # Sync standings to get all teams for this league
+        standings = client.sync_standings(league)
+        teams_data = standings.standings_data if isinstance(standings.standings_data, list) else [standings.standings_data]
+        
+        # Extract team info with name and team_key
+        teams = []
+        for td_idx, td in enumerate(teams_data):
+            try:
+                # Flatten if nested list of dicts
+                if isinstance(td, list):
+                    flattened = {}
+                    for item in td:
+                        if isinstance(item, dict):
+                            flattened.update(item)
+                    td = flattened
+                
+                if not isinstance(td, dict):
+                    continue
+                
+                team_name = td.get("name", "Unknown")
+                if isinstance(team_name, dict):
+                    team_name = team_name.get("full", "Unknown")
+                elif isinstance(team_name, list):
+                    name_str = "Unknown"
+                    for item in team_name:
+                        if isinstance(item, dict) and "full" in item:
+                            name_str = item["full"]
+                            break
+                        elif isinstance(item, str):
+                            name_str = item
+                            break
+                    team_name = name_str
+                
+                team_key_val = td.get("team_key", "")
+                if not team_key_val:
+                    continue
+                
+                teams.append({
+                    "name": team_name,
+                    "team_key": team_key_val
+                })
+            except Exception:
+                continue
+        
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Teams - """ + league.name + """</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    max-width: 800px;
+                    margin: 0 auto;
+                    padding: 20px;
+                    background: #1a1a2e;
+                    color: #eee;
+                }
+                h1 { color: #e94560; }
+                .team-list {
+                    list-style: none;
+                    padding: 0;
+                }
+                .team-item {
+                    background: #16213e;
+                    padding: 16px 20px;
+                    border-radius: 8px;
+                    margin: 10px 0;
+                    border: 1px solid #333;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                }
+                .team-item:hover {
+                    border-color: #e94560;
+                    background: #1a2744;
+                }
+                .team-name {
+                    font-size: 18px;
+                    font-weight: bold;
+                }
+                .btn {
+                    display: inline-block;
+                    padding: 8px 16px;
+                    background: #e94560;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 5px;
+                    font-size: 14px;
+                }
+                .btn:hover { background: #c73e54; }
+                .btn-secondary {
+                    background: #333;
+                    color: white;
+                    text-decoration: none;
+                    padding: 8px 16px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                }
+                .header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 20px 0;
+                    border-bottom: 1px solid #333;
+                }
+                .info { color: #888; font-size: 14px; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <div>
+                    <h1>👥 """ + league.name + """</h1>
+                    <p class="info">Select a team to view their roster</p>
+                </div>
+                <div>
+                    <a href="/league/""" + league_key + """/rosters" class="btn-secondary">All Lineups</a>
+                    <a href="/dashboard" class="btn-secondary">Dashboard</a>
+                </div>
+            </div>
+            <ul class="team-list">
+        """
+        
+        for team in teams:
+            html += f"""
+                <li class="team-item">
+                    <span class="team-name">🏆 {team['name']}</span>
+                    <a href="/sync/roster/{team['team_key']}" class="btn">View Roster</a>
+                </li>
+            """
+        
+        html += """
+            </ul>
+        </body>
+        </html>
+        """
+        return html
+        
+    except Exception as e:
+        logger.exception(f"League teams error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/league/{league_key}/rosters", response_class=HTMLResponse)
+async def view_league_rosters(league_key: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Show current lineup/roster for each team in a league.
+    """
+    user = get_current_user(request, db)
+    
+    if not user:
+        return RedirectResponse("/login")
+    
+    try:
+        client = YahooFantasyClient(user, db)
+        
+        # Get or sync league
+        league = db.query(League).filter(League.league_key == league_key).first()
+        if not league:
+            client.sync_leagues()
+            league = db.query(League).filter(League.league_key == league_key).first()
+        
+        if not league:
+            raise HTTPException(status_code=404, detail="League not found")
+        
+        # Sync standings to get all teams for this league
+        standings = client.sync_standings(league)
+        teams_data = standings.standings_data if isinstance(standings.standings_data, list) else [standings.standings_data]
+        
+        # Get or create team records and sync rosters
+        team_rosters = []
+        for td_idx, td in enumerate(teams_data):
+            try:
+                # Yahoo sometimes returns team entries as a list of single-key dicts
+                # instead of a flat dict. Flatten it if necessary.
+                if isinstance(td, list):
+                    flattened = {}
+                    for item in td:
+                        if isinstance(item, dict):
+                            flattened.update(item)
+                    td = flattened
+                
+                if not isinstance(td, dict):
+                    logger.warning(f"Skipping team entry {td_idx}: not a dict (type={type(td).__name__})")
+                    continue
+                
+                # Extract team info
+                team_name = td.get("name", "Unknown")
+                if isinstance(team_name, dict):
+                    team_name = team_name.get("full", "Unknown")
+                elif isinstance(team_name, list):
+                    # Sometimes name is wrapped in a list of dicts
+                    name_str = "Unknown"
+                    for item in team_name:
+                        if isinstance(item, dict) and "full" in item:
+                            name_str = item["full"]
+                            break
+                        elif isinstance(item, str):
+                            name_str = item
+                            break
+                    team_name = name_str
+                team_key_val = td.get("team_key", "")
+                
+                if not team_key_val:
+                    logger.warning(f"Skipping team entry {td_idx}: no team_key found. Keys: {list(td.keys())}")
+                    continue
+                
+                # Sync team record
+                team = client.sync_team(team_key_val)
+                
+                # Sync roster using the league's current week
+                roster = client.sync_roster(team, week=league.current_week)
+                roster_data = roster.roster_data
+                logger.info(f"Roster data type: {type(roster_data).__name__}, keys: {roster_data.keys() if isinstance(roster_data, dict) else 'N/A'}")
+                
+                # Ensure roster_data is a dict with players
+                players = []
+                if isinstance(roster_data, dict):
+                    raw_players = roster_data.get("players", [])
+                    if isinstance(raw_players, list):
+                        players = raw_players
+                    elif isinstance(raw_players, dict):
+                        players = raw_players.get("player", [])
+                        if not isinstance(players, list):
+                            players = [players] if players else []
+                elif isinstance(roster_data, list):
+                    # If roster_data is a bare list, treat it as the players list directly
+                    players = roster_data
+                
+                if not isinstance(players, list):
+                    players = [players] if players else []
+                
+                team_rosters.append({
+                    "name": team_name,
+                    "team_key": team_key_val,
+                    "players": players
+                })
+            except Exception as team_err:
+                logger.exception(f"Error processing team entry {td_idx} (team_key={td.get('team_key', '?') if isinstance(td, dict) else 'N/A'}): {team_err}")
+                # Continue processing other teams rather than failing the entire page
+                continue
+        
+        # Build HTML
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>League Lineups - """ + league.name + """</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    max-width: 1400px;
+                    margin: 0 auto;
+                    padding: 20px;
+                    background: #1a1a2e;
+                    color: #eee;
+                }
+                h1 { color: #e94560; }
+                .team-section {
+                    background: #16213e;
+                    padding: 20px;
+                    border-radius: 10px;
+                    margin: 20px 0;
+                    border: 1px solid #333;
+                }
+                .team-section h2 {
+                    color: #e94560;
+                    border-bottom: 1px solid #333;
+                    padding-bottom: 10px;
+                    margin-top: 0;
+                }
+                table { width: 100%; border-collapse: collapse; font-size: 14px; }
+                th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #333; white-space: nowrap; }
+                th { color: #888; background: #0f3460; position: sticky; top: 0; }
+                tr:nth-child(even) { background: rgba(15, 52, 96, 0.3); }
+                .btn {
+                    display: inline-block;
+                    padding: 8px 16px;
+                    background: #e94560;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 5px;
+                    margin: 10px 0;
+                }
+                .btn-secondary {
+                    background: #333;
+                    color: white;
+                    text-decoration: none;
+                    padding: 8px 16px;
+                    border-radius: 5px;
+                }
+                .header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 20px 0;
+                    border-bottom: 1px solid #333;
+                }
+                .pos-badge {
+                    display: inline-block;
+                    background: #0f3460;
+                    padding: 2px 8px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: bold;
+                    color: #4ade80;
+                }
+                .status-injured { color: #e94560; }
+                .status-active { color: #4ade80; }
+                .team-summary {
+                    display: flex;
+                    gap: 20px;
+                    margin: 10px 0;
+                    font-size: 14px;
+                    color: #888;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <div>
+                    <h1>📋 Lineups: """ + league.name + """</h1>
+                    <p>Week: """ + str(league.current_week) + """ | Teams: """ + str(league.num_teams) + """</p>
+                </div>
+                <div>
+                    <a href="/standings" class="btn-secondary">Standings</a>
+                    <a href="/dashboard" class="btn-secondary">Dashboard</a>
+                </div>
+            </div>
+        """
+        
+        for tr in team_rosters:
+            name = tr["name"]
+            players = tr["players"]
+            active_count = sum(1 for p in players if isinstance(p, dict) and p.get("status", "-") != "IL")
+            il_count = sum(1 for p in players if isinstance(p, dict) and p.get("status", "-") == "IL")
+            
+            html += f"""
+            <div class="team-section">
+                <h2>🏆 {name}</h2>
+                <div class="team-summary">
+                    <span>Players: {len(players)}</span>
+                    <span>Active: {active_count}</span>
+                    <span>IL: {il_count}</span>
+                </div>
+                <table>
+                    <tr>
+                        <th>Pos</th>
+                        <th>Player</th>
+                        <th>Status</th>
+                        <th>Eligible Positions</th>
+                    </tr>
+            """
+            
+            for player in players:
+                if not isinstance(player, dict):
+                    continue
+                # Safely get nested dict values, handling cases where Yahoo returns lists
+                _name = player.get("name", {})
+                if not isinstance(_name, dict):
+                    _name = {}
+                player_name = _name.get("full", "Unknown")
+                
+                _pos = player.get("selected_position", {})
+                if not isinstance(_pos, dict):
+                    _pos = {}
+                pos = _pos.get("position", "N/A")
+                
+                status = player.get("status", "-")
+                
+                _elig = player.get("eligible_positions", {})
+                if isinstance(_elig, dict):
+                    eligible = _elig.get("position", "-")
+                elif isinstance(_elig, list):
+                    eligible = _elig
+                else:
+                    eligible = "-"
+                
+                status_class = "status-injured" if status == "IL" else "status-active"
+                
+                html += f"""
+                    <tr>
+                        <td><span class="pos-badge">{pos}</span></td>
+                        <td><strong>{player_name}</strong></td>
+                        <td class="{status_class}">{status if status != "-" else "Active"}</td>
+                        <td>{eligible if isinstance(eligible, str) else ', '.join(eligible) if isinstance(eligible, list) else '-'}</td>
+                    </tr>
+                """
+            
+            html += """
+                </table>
+            </div>
+            """
+        
+        html += """
+        </body>
+        </html>
+        """
+        return html
+        
+    except Exception as e:
+        logger.exception(f"League rosters error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, db: Session = Depends(get_db)):
     """
@@ -361,6 +788,7 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
                 <p class="info">Key: {league.league_key}</p>
                 <p>Teams: {league.num_teams} | Week: {league.current_week}</p>
                 <button onclick="loadLeagueInfo('{league.league_key}')" class="btn">View Details</button>
+                <a href="/league/{league.league_key}/teams" class="btn">👥 View Teams</a>
                 <a href="/sync/standings/{league.league_key}" class="btn">Standings</a>
             </div>
             """
@@ -435,11 +863,28 @@ async def sync_roster(team_key: str, request: Request, db: Session = Depends(get
         if not team:
             team = client.sync_team(team_key)
         
-        # Sync roster
-        roster = client.sync_roster(team)
+        # Determine league's current week to pass to roster sync
+        league_key = team_key.rsplit('.t.', 1)[0]
+        league = db.query(League).filter(League.league_key == league_key).first()
+        current_week = league.current_week if league else 1
         
-        # Format response
-        players = roster.roster_data.get("players", {}).get("player", [])
+        # Sync roster with current week
+        roster = client.sync_roster(team, week=current_week)
+        
+        # Format response - handle both dict {players: [...]} and list formats
+        roster_data = roster.roster_data
+        players = []
+        if isinstance(roster_data, dict):
+            raw_players = roster_data.get("players", [])
+            if isinstance(raw_players, list):
+                players = raw_players
+            elif isinstance(raw_players, dict):
+                players = raw_players.get("player", [])
+                if not isinstance(players, list):
+                    players = [players] if players else []
+        elif isinstance(roster_data, list):
+            players = roster_data
+        
         if not isinstance(players, list):
             players = [players] if players else []
         
@@ -486,17 +931,43 @@ async def sync_roster(team_key: str, request: Request, db: Session = Depends(get
         """
         
         for player in players:
-            name = player.get("name", {}).get("full", "Unknown")
-            pos = player.get("selected_position", {}).get("position", "N/A")
+            if not isinstance(player, dict):
+                continue
+            # Safely get nested dict values, handling cases where Yahoo returns lists
+            _name = player.get("name", {})
+            if not isinstance(_name, dict):
+                _name = {}
+            name = _name.get("full", "Unknown")
+            
+            _pos = player.get("selected_position", {})
+            if not isinstance(_pos, dict):
+                _pos = {}
+            pos = _pos.get("position", "N/A")
+            
             status = player.get("status", "-")
-            eligible = player.get("eligible_positions", {}).get("position", "-")
+            
+            _elig = player.get("eligible_positions", {})
+            if isinstance(_elig, dict):
+                eligible = _elig.get("position", "-")
+            elif isinstance(_elig, list):
+                # Yahoo returns eligible_positions as a list of dicts like [{"position": "OF"}, {"position": "1B"}]
+                # or sometimes a list of strings. Handle both.
+                pos_strings = []
+                for item in _elig:
+                    if isinstance(item, str):
+                        pos_strings.append(item)
+                    elif isinstance(item, dict) and "position" in item:
+                        pos_strings.append(item["position"])
+                eligible = ', '.join(pos_strings) if pos_strings else "-"
+            else:
+                eligible = "-"
             
             html += f"""
                 <tr>
                     <td>{name}</td>
                     <td>{pos}</td>
                     <td>{status}</td>
-                    <td>{eligible if isinstance(eligible, str) else ', '.join(eligible) if isinstance(eligible, list) else '-'}</td>
+                    <td>{eligible}</td>
                 </tr>
             """
         
