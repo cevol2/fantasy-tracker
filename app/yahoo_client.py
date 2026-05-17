@@ -352,6 +352,62 @@ class YahooFantasyClient:
         
         logger.info(f"Retrieved roster with {len(parsed_players)} players")
         return roster
+
+    def get_league_players(self, league_key: str, status: str = "FA", count: int = 200) -> list[dict]:
+        """
+        Get available/waiver players for a league.
+        
+        Status filters (Yahoo API valid values):
+          'FA' - Free Agents (unowned players available to pick up)
+          'W' - Waiver (players currently on waivers)
+          'A' - All players
+        
+        Yahoo response format:
+        fantasy_content.league = [
+          {league_metadata},
+          {players: {0: {player: [props, sub]}, count: N}}
+        ]
+        """
+        logger.info(f"Fetching {status} players for league: {league_key}")
+        url = f"{self.base_url}/league/{league_key}/players;status={status};count={count}?format=json"
+        data = self._make_request("GET", url)
+        
+        parsed_players = []
+        try:
+            fc = data.get("fantasy_content", {})
+            league_arr = fc.get("league", [])
+            if not isinstance(league_arr, list) or len(league_arr) < 2:
+                logger.warning(f"Unexpected league format for players: {type(league_arr)}")
+                return []
+            
+            players_container = league_arr[1].get("players") if isinstance(league_arr[1], dict) else {}
+            if not isinstance(players_container, dict):
+                return []
+            
+            for pk in sorted(players_container.keys(), key=lambda x: (not str(x).isdigit(), int(x) if str(x).isdigit() else x)):
+                player_entry = players_container[pk]
+                if not isinstance(player_entry, dict) or "player" not in player_entry:
+                    continue
+                player_arr = player_entry["player"]
+                if not isinstance(player_arr, list) or len(player_arr) < 1:
+                    continue
+                props_list = player_arr[0]
+                player_data = {}
+                if isinstance(props_list, list):
+                    for prop in props_list:
+                        if isinstance(prop, dict):
+                            player_data.update(prop)
+                elif isinstance(props_list, dict):
+                    player_data.update(props_list)
+                # Merge subresources
+                if len(player_arr) > 1 and isinstance(player_arr[1], dict):
+                    player_data.update(player_arr[1])
+                parsed_players.append(player_data)
+        except Exception as e:
+            logger.warning(f"Error parsing league players: {e}")
+        
+        logger.info(f"Retrieved {len(parsed_players)} available players for league {league_key}")
+        return parsed_players
     
     @staticmethod
     def _game_key_to_season(game_key: str) -> int:

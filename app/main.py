@@ -367,6 +367,24 @@ async def view_league_teams(league_key: str, request: Request, db: Session = Dep
                     border-bottom: 1px solid #333;
                 }
                 .info { color: #888; font-size: 14px; }
+                .waiver-item {
+                    background: #0f3460;
+                    flex-wrap: wrap;
+                    gap: 8px;
+                }
+                .waiver-item:hover {
+                    border-color: #4ade80;
+                    background: #1a3a6e;
+                }
+                .waiver-item .team-name {
+                    color: #4ade80;
+                    min-width: 200px;
+                }
+                .waiver-desc {
+                    color: #888;
+                    font-size: 14px;
+                    flex: 1;
+                }
             </style>
         </head>
         <body>
@@ -392,6 +410,13 @@ async def view_league_teams(league_key: str, request: Request, db: Session = Dep
             """
         
         html += """
+            </ul>
+            <ul class="team-list">
+                <li class="team-item waiver-item">
+                    <span class="team-name">📋 Waiver Wire</span>
+                    <span class="waiver-desc">Available players (Free Agents & Waivers)</span>
+                    <a href="/league/""" + league_key + """/waiver" class="btn">View Waiver Wire</a>
+                </li>
             </ul>
         </body>
         </html>
@@ -1170,6 +1195,229 @@ async def view_all_standings(request: Request, db: Session = Depends(get_db)):
     </html>
     """
     return html
+
+
+@app.get("/league/{league_key}/waiver", response_class=HTMLResponse)
+async def view_waiver_wire(league_key: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Show available waiver wire / free agent players for a league.
+    """
+    user = get_current_user(request, db)
+    
+    if not user:
+        return RedirectResponse("/login")
+    
+    try:
+        client = YahooFantasyClient(user, db)
+        
+        # Get or sync league
+        league = db.query(League).filter(League.league_key == league_key).first()
+        if not league:
+            client.sync_leagues()
+            league = db.query(League).filter(League.league_key == league_key).first()
+        
+        if not league:
+            raise HTTPException(status_code=404, detail="League not found")
+        
+        # Fetch available players ('FA' = Free Agents, unowned players)
+        players = client.get_league_players(league_key, status="FA", count=200)
+        
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Waiver Wire - """ + league.name + """</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    max-width: 1400px;
+                    margin: 0 auto;
+                    padding: 20px;
+                    background: #1a1a2e;
+                    color: #eee;
+                }
+                h1 { color: #e94560; }
+                table { width: 100%; border-collapse: collapse; font-size: 14px; }
+                th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #333; white-space: nowrap; }
+                th { color: #888; background: #16213e; position: sticky; top: 0; }
+                tr:nth-child(even) { background: rgba(15, 52, 96, 0.3); }
+                .btn {
+                    display: inline-block;
+                    padding: 8px 16px;
+                    background: #e94560;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 5px;
+                    margin: 10px 0;
+                }
+                .btn-secondary {
+                    background: #333;
+                    color: white;
+                    text-decoration: none;
+                    padding: 8px 16px;
+                    border-radius: 5px;
+                }
+                .header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 20px 0;
+                    border-bottom: 1px solid #333;
+                }
+                .pos-badge {
+                    display: inline-block;
+                    background: #0f3460;
+                    padding: 2px 8px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: bold;
+                    color: #4ade80;
+                }
+                .status-waiver { color: #fbbf24; }
+                .status-freeagent { color: #4ade80; }
+                .search-box {
+                    margin: 20px 0;
+                    padding: 12px;
+                    background: #16213e;
+                    border-radius: 8px;
+                    border: 1px solid #333;
+                }
+                .search-box input {
+                    width: 100%;
+                    padding: 10px;
+                    border: 1px solid #333;
+                    border-radius: 5px;
+                    background: #0f3460;
+                    color: #eee;
+                    font-size: 16px;
+                    box-sizing: border-box;
+                }
+                .search-box input:focus { outline: none; border-color: #e94560; }
+                .count-badge {
+                    display: inline-block;
+                    background: #0f3460;
+                    padding: 4px 12px;
+                    border-radius: 12px;
+                    font-size: 14px;
+                    color: #888;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <div>
+                    <h1>📋 Waiver Wire: """ + league.name + """</h1>
+                    <p>Available players (Free Agents & Waivers)</p>
+                </div>
+                <div>
+                    <a href="/league/""" + league_key + """/teams" class="btn-secondary">← Teams</a>
+                    <a href="/dashboard" class="btn-secondary">Dashboard</a>
+                </div>
+            </div>
+            <div class="search-box">
+                <input type="text" id="playerSearch" placeholder="Search players by name..." onkeyup="filterPlayers()">
+            </div>
+            <p><span class="count-badge">""" + str(len(players)) + """ players found</span></p>
+            <div style="overflow-x: auto;">
+            <table id="playersTable">
+                <tr>
+                    <th>Name</th>
+                    <th>Team</th>
+                    <th>Position</th>
+                    <th>Eligible Positions</th>
+                    <th>Status</th>
+                    <th>% Owned</th>
+                </tr>
+        """
+        
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            
+            _name = player.get("name", {})
+            if not isinstance(_name, dict):
+                _name = {}
+            player_name = _name.get("full", "Unknown")
+            
+            editorial_team = player.get("editorial_team_full_name", player.get("editorial_team_abbr", ""))
+            
+            _pos = player.get("display_position", player.get("primary_position", "N/A"))
+            
+            _elig = player.get("eligible_positions", {})
+            if isinstance(_elig, dict):
+                eligible = _elig.get("position", "-")
+            elif isinstance(_elig, list):
+                pos_strings = []
+                for item in _elig:
+                    if isinstance(item, str):
+                        pos_strings.append(item)
+                    elif isinstance(item, dict) and "position" in item:
+                        pos_strings.append(item["position"])
+                eligible = ', '.join(pos_strings) if pos_strings else "-"
+            else:
+                eligible = "-"
+            
+            status = player.get("status", "-")
+            ownership = player.get("ownership", {})
+            if not isinstance(ownership, dict):
+                ownership = {}
+            percent_owned = ownership.get("percent_owned", "-")
+            if isinstance(percent_owned, dict):
+                percent_owned = percent_owned.get("value", "-")
+            
+            # Determine if waiver or free agent based on status or ownership
+            is_waiver = player.get("is_waiver", False)
+            if isinstance(is_waiver, dict):
+                is_waiver = False
+            
+            html += f"""
+                <tr>
+                    <td><strong>{player_name}</strong></td>
+                    <td>{editorial_team}</td>
+                    <td><span class="pos-badge">{_pos}</span></td>
+                    <td>{eligible}</td>
+        """
+        
+            if status and status != "-" and status != "W":
+                html += f'<td>{status}</td>'
+            else:
+                html += f'<td class="status-freeagent">FA</td>'
+            
+            html += f"""
+                    <td>{percent_owned if percent_owned != "-" else "0%"}</td>
+                </tr>
+            """
+        
+        html += """
+            </table>
+            </div>
+            <script>
+            function filterPlayers() {
+                var input = document.getElementById("playerSearch");
+                var filter = input.value.toUpperCase();
+                var table = document.getElementById("playersTable");
+                var tr = table.getElementsByTagName("tr");
+                for (var i = 1; i < tr.length; i++) {
+                    var td = tr[i].getElementsByTagName("td")[0];
+                    if (td) {
+                        var txtValue = td.textContent || td.innerText;
+                        if (txtValue.toUpperCase().indexOf(filter) > -1) {
+                            tr[i].style.display = "";
+                        } else {
+                            tr[i].style.display = "none";
+                        }
+                    }
+                }
+            }
+            </script>
+        </body>
+        </html>
+        """
+        return html
+        
+    except Exception as e:
+        logger.exception(f"Waiver wire error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/sync/standings/{league_key}", response_class=HTMLResponse)
