@@ -1359,11 +1359,28 @@ async def view_waiver_wire(league_key: str, request: Request, db: Session = Depe
             
             status = player.get("status", "-")
             ownership = player.get("ownership", {})
-            if not isinstance(ownership, dict):
-                ownership = {}
-            percent_owned = ownership.get("percent_owned", "-")
-            if isinstance(percent_owned, dict):
-                percent_owned = percent_owned.get("value", "-")
+            percent_owned = "-"
+            if isinstance(ownership, dict):
+                percent_owned = ownership.get("percent_owned", "-")
+                if isinstance(percent_owned, dict):
+                    percent_owned = percent_owned.get("value", "0")
+            elif isinstance(ownership, list):
+                # Yahoo returns ownership as a list like:
+                # [{"ownership": [{"0": {"owner": ...}}, {"percent_owned": {"value": "47"}}]}]
+                for item in ownership:
+                    if isinstance(item, dict):
+                        if "percent_owned" in item:
+                            po = item["percent_owned"]
+                            percent_owned = po.get("value", "0") if isinstance(po, dict) else po
+                            break
+                        # Check for nested structure: {ownership: [...]}
+                        sub = item.get("ownership", [])
+                        if isinstance(sub, list):
+                            for sub_item in sub:
+                                if isinstance(sub_item, dict) and "percent_owned" in sub_item:
+                                    po = sub_item["percent_owned"]
+                                    percent_owned = po.get("value", "0") if isinstance(po, dict) else po
+                                    break
             
             # Determine if waiver or free agent based on status or ownership
             is_waiver = player.get("is_waiver", False)
