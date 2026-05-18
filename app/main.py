@@ -957,7 +957,7 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
             
             modal.classList.add('active');
             title.textContent = 'League Player Totals';
-            content.innerHTML = '<div class="loading-spinner">⏳ Loading league totals...</div>';
+            content.innerHTML = '<div class="loading-spinner">⏳ Loading team stats...</div>';
             
             fetch('/api/league/' + encodeURIComponent(leagueKey) + '/player_totals')
                 .then(r => r.json())
@@ -967,40 +967,52 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
                         return;
                     }
                     
-                    title.textContent = '📊 ' + data.league_name + ' - Player Totals';
+                    title.textContent = '📊 ' + data.league_name + ' - Team Stats';
                     
                     let html = '<div class="totals-section">';
                     
                     // Batting table
-                    html += '<h3>🟢 Batting Totals</h3>';
-                    html += '<table class="totals-table"><tr>';
+                    html += '<h3>🟢 Batters</h3>';
+                    html += '<div style="overflow-x:auto;"><table class="totals-table"><tr><th>Team</th>';
                     for (let label of data.batting.labels) {
-                        html += '<th>' + label + '</th>';
+                        html += '<th>' + label.label + '</th>';
                     }
-                    html += '</tr><tr>';
-                    for (let val of data.batting.values) {
-                        html += '<td class="stat-total">' + val + '</td>';
+                    html += '</tr>';
+                    
+                    for (let team of data.batting.teams) {
+                        html += '<tr><td><strong>' + team.name + '</strong></td>';
+                        for (let col of data.batting.columns) {
+                            let val = team.stats[col] || '-';
+                            html += '<td>' + val + '</td>';
+                        }
+                        html += '</tr>';
                     }
-                    html += '</tr></table>';
+                    html += '</table></div>';
                     
                     // Pitching table
-                    html += '<h3 style="margin-top: 24px;">🔴 Pitching Totals</h3>';
-                    html += '<table class="totals-table"><tr>';
+                    html += '<h3 style="margin-top: 24px;">🔴 Pitchers</h3>';
+                    html += '<div style="overflow-x:auto;"><table class="totals-table"><tr><th>Team</th>';
                     for (let label of data.pitching.labels) {
-                        html += '<th>' + label + '</th>';
+                        html += '<th>' + label.label + '</th>';
                     }
-                    html += '</tr><tr>';
-                    for (let val of data.pitching.values) {
-                        html += '<td class="stat-total">' + val + '</td>';
-                    }
-                    html += '</tr></table>';
+                    html += '</tr>';
                     
-                    html += '<p style="color:#666;font-size:12px;margin-top:16px;">Aggregated team stats across all ' + data.team_count + ' teams</p>';
+                    for (let team of data.pitching.teams) {
+                        html += '<tr><td><strong>' + team.name + '</strong></td>';
+                        for (let col of data.pitching.columns) {
+                            let val = team.stats[col] || '-';
+                            html += '<td>' + val + '</td>';
+                        }
+                        html += '</tr>';
+                    }
+                    html += '</table></div>';
+                    
+                    html += '<p style="color:#666;font-size:12px;margin-top:16px;">' + data.team_count + ' teams</p>';
                     
                     content.innerHTML = html;
                 })
                 .catch(err => {
-                    content.innerHTML = '<div class="error-msg">❌ Failed to load totals: ' + err.message + '</div>';
+                    content.innerHTML = '<div class="error-msg">❌ Failed to load stats: ' + err.message + '</div>';
                 });
         }
         
@@ -1794,10 +1806,10 @@ async def api_league(league_key: str, request: Request, db: Session = Depends(ge
 @app.get("/api/league/{league_key}/player_totals")
 async def api_league_player_totals(league_key: str, request: Request, db: Session = Depends(get_db)):
     """
-    Get aggregate batting and pitching totals for all teams in a league.
+    Get per-team batting and pitching stats for all teams in a league.
     
-    Aggregates team_stats from all teams in the league standings to show
-    overall league-wide production broken down by batting and pitching categories.
+    Returns each team's name and their stat values, split into batting
+    and pitching categories, sourced from the league standings team_stats.
     """
     user = get_current_user(request, db)
     if not user:
@@ -1822,85 +1834,124 @@ async def api_league_player_totals(league_key: str, request: Request, db: Sessio
         if not teams:
             return {"error": "No standings data available. Sync the league first."}
         
-        # Aggregate stats across all teams
-        batting_totals = {}
-        pitching_totals = {}
-        
+        # Collect all stat IDs present across all teams (so columns are consistent)
+        batting_stat_ids = set()
+        pitching_stat_ids = set()
         for team_data in teams:
             ts = team_data.get("team_stats", {})
             if not isinstance(ts, dict):
                 continue
-            
             stats_arr = ts.get("stats", [])
             if not isinstance(stats_arr, list):
                 continue
-            
             for entry in stats_arr:
                 if not isinstance(entry, dict):
                     continue
                 stat_obj = entry.get("stat", {})
                 if not isinstance(stat_obj, dict):
                     continue
-                
-                stat_id = stat_obj.get("stat_id", "")
-                value = stat_obj.get("value", "0")
-                
-                if not stat_id or not value:
-                    continue
-                
-                # Skip rate stats for simple sums - they need special handling
-                # AVG (4, 3), OBP (5), OPS (55), ERA (26), WHIP (27)
-                if stat_id in ("4", "3", "5", "55", "26", "27"):
-                    continue
-                
-                try:
-                    num_val = float(value)
-                except (ValueError, TypeError):
-                    continue
-                
-                if stat_id in BATTING_STATS:
-                    batting_totals[stat_id] = batting_totals.get(stat_id, 0.0) + num_val
-                elif stat_id in PITCHING_STATS:
-                    pitching_totals[stat_id] = pitching_totals.get(stat_id, 0.0) + num_val
+                sid = stat_obj.get("stat_id", "")
+                if sid in BATTING_STATS:
+                    batting_stat_ids.add(sid)
+                elif sid in PITCHING_STATS:
+                    pitching_stat_ids.add(sid)
         
-        # Build ordered lists for batting
+        # Order stat IDs by preferred display order
+        batting_sids = [sid for sid in BATTING_ORDER if sid in batting_stat_ids]
+        pitching_sids = [sid for sid in PITCHING_ORDER if sid in pitching_stat_ids]
+        
+        # Build per-team data
+        def get_team_name(td):
+            name = td.get("name", "Unknown")
+            if isinstance(name, dict):
+                return name.get("full", "Unknown")
+            if isinstance(name, list):
+                for item in name:
+                    if isinstance(item, dict) and "full" in item:
+                        return item["full"]
+                    if isinstance(item, str):
+                        return item
+                return "Unknown"
+            return name if isinstance(name, str) else "Unknown"
+        
+        def parse_stat_value(value_str):
+            """Parse a stat value, returning a display string."""
+            if value_str is None or value_str == "":
+                return "-"
+            try:
+                val = float(value_str)
+                if val == int(val):
+                    return str(int(val))
+                return f"{val:.1f}" if val % 0.1 != 0 else f"{val:.1f}"
+            except (ValueError, TypeError):
+                return value_str if value_str else "-"
+        
+        teams_data = []
+        for team_data in teams:
+            name = get_team_name(team_data)
+            ts = team_data.get("team_stats", {})
+            if not isinstance(ts, dict):
+                ts = {}
+            stats_arr = ts.get("stats", [])
+            if not isinstance(stats_arr, list):
+                stats_arr = []
+            
+            # Build stat map
+            stat_map = {}
+            for entry in stats_arr:
+                if not isinstance(entry, dict):
+                    continue
+                stat_obj = entry.get("stat", {})
+                if not isinstance(stat_obj, dict):
+                    continue
+                sid = stat_obj.get("stat_id", "")
+                value = stat_obj.get("value", "")
+                if sid:
+                    stat_map[sid] = value
+            
+            # Build batting and pitching row values
+            batting_row = {}
+            for sid in batting_sids:
+                batting_row[sid] = parse_stat_value(stat_map.get(sid))
+            
+            pitching_row = {}
+            for sid in pitching_sids:
+                pitching_row[sid] = parse_stat_value(stat_map.get(sid))
+            
+            teams_data.append({
+                "name": name,
+                "team_key": team_data.get("team_key", ""),
+                "batting": batting_row,
+                "pitching": pitching_row
+            })
+        
+        # Build column labels for batting and pitching
         batting_labels = []
-        batting_values = []
-        for sid in BATTING_ORDER:
-            if sid in batting_totals:
-                label = CAT_NAMES.get(sid, sid)
-                val = batting_totals[sid]
-                if sid == "50":  # IP - format as X.X
-                    batting_labels.append(label)
-                    batting_values.append(f"{val:.1f}")
-                else:
-                    batting_labels.append(label)
-                    batting_values.append(f"{int(val)}")
+        for sid in batting_sids:
+            batting_labels.append({"stat_id": sid, "label": CAT_NAMES.get(sid, sid)})
         
-        # Build ordered lists for pitching
         pitching_labels = []
-        pitching_values = []
-        for sid in PITCHING_ORDER:
-            if sid in pitching_totals:
-                label = CAT_NAMES.get(sid, sid)
-                val = pitching_totals[sid]
-                if sid == "50":  # IP
-                    pitching_labels.append(label)
-                    pitching_values.append(f"{val:.1f}")
-                else:
-                    pitching_labels.append(label)
-                    pitching_values.append(f"{int(val)}")
+        for sid in pitching_sids:
+            pitching_labels.append({"stat_id": sid, "label": CAT_NAMES.get(sid, sid)})
         
         return {
             "league_name": league.name,
             "team_count": len(teams),
             "batting": {
                 "labels": batting_labels,
-                "values": batting_values
+                "columns": batting_sids,
+                "teams": [
+                    {"name": t["name"], "stats": t["batting"]}
+                    for t in teams_data
+                ]
             },
             "pitching": {
                 "labels": pitching_labels,
-                "values": pitching_values
+                "columns": pitching_sids,
+                "teams": [
+                    {"name": t["name"], "stats": t["pitching"]}
+                    for t in teams_data
+                ]
             }
         }
         
